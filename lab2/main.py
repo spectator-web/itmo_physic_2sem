@@ -192,7 +192,7 @@ class Statistics:
     def total_error(values: List[float], t_coef: float, instr_error: float) -> float:
         """Полная погрешность = sqrt(случайная^2 + приборная^2)."""
         rand_err = Statistics.student_error(values, t_coef)
-        return math.sqrt(rand_err ** 2 + instr_error ** 2)
+        return math.sqrt(rand_err ** 2 + ((2/3)*instr_error) ** 2)
 
 
 # ------------------------------------------------------------
@@ -201,19 +201,38 @@ class Statistics:
 class PhysicsCalculator:
     @staticmethod
     def acceleration(t: float, h: float) -> float:
-        """a = 2h / t^2"""
+        """Ускорение груза: a = 2h / t^2"""
         return 2 * h / (t * t)
 
     @staticmethod
     def angular_acceleration(a: float, d: float) -> float:
-        """ε = 2a / d"""
+        """Угловое ускорение: ε = 2a / d"""
         return 2 * a / d
 
     @staticmethod
     def moment(t: float, m: float, d: float, g: float, h: float) -> float:
-        """M = (m*d/2) * (g - a)"""
+        """Момент силы натяжения: M = (m*d/2)*(g - 2h/t^2)"""
         a = PhysicsCalculator.acceleration(t, h)
         return (m * d / 2) * (g - a)
+
+    @staticmethod
+    def delta_acceleration(a, t, dt, h, dh):
+        rel = math.sqrt((dh/h)**2 + (2*dt/t)**2)
+        return a * rel, rel
+
+    @staticmethod
+    def delta_angular_acceleration(eps, a, da, d, dd):
+        rel = math.sqrt((da/a)**2 + (dd/d)**2) if a != 0 else 0
+        return eps * rel, rel
+
+    @staticmethod
+    def delta_moment(M, m, dm, d, dd, g, dg, a, da):
+        denom = (g - a)
+        if denom == 0:
+            rel = float('inf')
+        else:
+            rel = math.sqrt((dm/m)**2 + (dd/d)**2 + (dg**2 + da**2)/(denom**2))
+        return M * rel, rel
 
 
 # ------------------------------------------------------------
@@ -268,9 +287,9 @@ class ExperimentData:
     def __init__(self):
         self.times = []          # list[position][load][measurement]
         self.instr_meas = []     # list of (value, error)
-        self.student_coef = 2.0  # по умолчанию
+        self.student_coef = 4.3  # по умолчанию для трёх измерений и α=0.95
         self.instr_error_time = 0.25  # приборная погрешность секундомера (с)
-        self.height = 1.0         # м (по умолчанию)
+        self.height = 0.7       # м (по умолчанию)
         self.diameter = 0.046     # м (по умолчанию 4.6 см)
         self.masses = []          # кг, для каждой нагрузки
         self.g = 9.81             # м/с²
@@ -278,6 +297,10 @@ class ExperimentData:
         self.l1 = 0.057           # м
         self.l0 = 0.025           # м
         self.b = 0.04             # м
+        self.delta_h = 0.0005      # м
+        self.delta_d = 0.0005      # м
+        self.delta_m = 0.0005      # кг
+        self.delta_g = 0.01        # м/с²
         # Дополнительно: номера рисок (позиций)
         self.positions = []       # список номеров рисок (например, 1..n)
 
@@ -331,7 +354,7 @@ def print_menu(data: ExperimentData):
         print(f"  Массы нагрузок: {data.masses}")
     print("-" * 70)
     print("1. Загрузить данные из файла")
-    print("2. Показать исходные данные (сырые времена)")
+    print("2. Показать полный отчёт (все данные и расчёты)")
     print("3. Рассчитать средние времена")
     print("4. Рассчитать статистику (СКО, погрешности)")
     print("5. Рассчитать физические величины (a, ε, M)")
@@ -339,9 +362,8 @@ def print_menu(data: ExperimentData):
     print("7. МНК для I(R²) (проверка теоремы Штейнера)")
     print("8. Вывести итоговую таблицу (position load t1 t2 t3 t_avg sigma dt a epsilon M)")
     print("9. Экспорт таблицы в файл")
-    print("10. Изменить коэффициент Стьюдента")
-    print("11. Изменить приборную погрешность времени")
-    print("12. Ручной ввод параметров установки")
+    print("10. Изменить приборную погрешность времени")
+    print("11. Ручной ввод параметров установки")
     print("0. Выход")
     print("-" * 70)
 
@@ -368,6 +390,147 @@ def input_int(prompt: str, default: Optional[int] = None) -> int:
             print("Ошибка: введите целое число.")
 
 
+def set_student_coef_interactively(data: ExperimentData):
+    """Предлагает пользователю изменить коэффициент Стьюдента."""
+    print(f"\nТекущий коэффициент Стьюдента: {data.student_coef:.3f}")
+    if SCIPY_AVAILABLE:
+        ans = input("Вычислить автоматически по вероятности и числу измерений? (y/n): ").strip().lower()
+        if ans in ('y', 'yes', 'д', 'да'):
+            prob = input_float("Доверительная вероятность (например, 0.95): ", 0.95)
+            n = input_int("Число измерений (n): ", data.get_num_measurements() or 3)
+            df = n - 1
+            t_val = stats.t.ppf((1 + prob) / 2, df)
+            data.student_coef = t_val
+            print(f"Коэффициент Стьюдента установлен: {t_val:.6f}")
+            return
+    # Если scipy недоступен или пользователь отказался, предложим ввести вручную
+    new_t = input_float("Введите коэффициент Стьюдента вручную (Enter для сохранения текущего): ", data.student_coef)
+    data.student_coef = new_t
+
+
+def print_full_report(data: ExperimentData):
+    """Выводит полный отчёт: параметры, исходные данные, статистику, расчёты, МНК."""
+    if not data.times:
+        print("Данные не загружены.")
+        return
+
+    # Параметры установки
+    print("\n" + "=" * 70)
+    print("ПОЛНЫЙ ОТЧЁТ")
+    print("=" * 70)
+    print("Параметры установки:")
+    print(f"  Высота падения h = {data.height:.3f} м")
+    print(f"  Диаметр ступицы d = {data.diameter:.4f} м")
+    print(f"  g = {data.g:.2f} м/с²")
+    print(f"  l1 = {data.l1:.3f} м, l0 = {data.l0:.3f} м, b = {data.b:.3f} м")
+    print(f"  Приборная погрешность времени = {data.instr_error_time:.4f} с")
+    print(f"  Коэффициент Стьюдента = {data.student_coef:.3f}")
+    print(f"  Погрешности измерений: dh = {data.delta_h:.4f} м, dd = {data.delta_d:.4f} м, dm = {data.delta_m:.4f} кг, dg = {data.delta_g:.4f} м/с²")
+    if data.masses:
+        print(f"  Массы нагрузок: {data.masses} кг")
+    else:
+        print("  Массы нагрузок не заданы (будут использованы значения по умолчанию).")
+
+    # Исходные данные (времена)
+    print("\nИсходные данные (время в секундах):")
+    for p_idx, pos in enumerate(data.times):
+        print(f"Позиция {p_idx+1}:")
+        for l_idx, load in enumerate(pos):
+            print(f"  Нагрузка {l_idx+1}: {load}")
+
+    # Статистика времени
+    print("\nСтатистика времени:")
+    print("Pos Load  t_avg     sigma     dt_rand   dt_total  rel%")
+    for p_idx, pos in enumerate(data.times):
+        for l_idx, load in enumerate(pos):
+            avg = Statistics.mean(load)
+            sigma = Statistics.std_dev(load)
+            rand_err = Statistics.student_error(load, data.student_coef)
+            total_err = Statistics.total_error(load, data.student_coef, data.instr_error_time)
+            rel = (total_err / avg * 100) if avg != 0 else 0
+            print(f"{p_idx+1:3d} {l_idx+1:4d}  {avg:8.6f}  {sigma:8.6f}  {rand_err:8.6f}  {total_err:8.6f}  {rel:6.2f}%")
+
+    # Физические величины с погрешностями
+    print("\nФизические величины (по среднему времени):")
+    print("Pos Load   t_avg      a (м/с²)   da        ε (рад/с²) deps      M (Н·м)    dM")
+    for p_idx, pos in enumerate(data.times):
+        for l_idx, load in enumerate(pos):
+            t_avg = Statistics.mean(load)
+            dt = Statistics.total_error(load, data.student_coef, data.instr_error_time)
+            a = PhysicsCalculator.acceleration(t_avg, data.height)
+            da, _ = PhysicsCalculator.delta_acceleration(a, t_avg, dt, data.height, data.delta_h)
+            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
+            deps, _ = PhysicsCalculator.delta_angular_acceleration(eps, a, da, data.diameter, data.delta_d)
+            # Определяем массу нагрузки (если не задана, используем заглушку)
+            if l_idx < len(data.masses):
+                m_load = data.masses[l_idx]
+            else:
+                m_load = 0.22 * (l_idx + 1)
+            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
+            dM, _ = PhysicsCalculator.delta_moment(M, m_load, data.delta_m, data.diameter, data.delta_d, data.g, data.delta_g, a, da)
+            print(f"{p_idx+1:3d} {l_idx+1:4d}  {t_avg:8.6f}  {a:10.6f}  {da:8.6f}  {eps:10.6f}  {deps:8.6f}  {M:10.6f}  {dM:8.6f}")
+
+    # МНК для M(ε) по каждой позиции
+    print("\nМНК для зависимости M = I·ε + Mтр по каждой позиции:")
+    mnk_results = []
+    for p_idx, pos in enumerate(data.times):
+        eps_list = []
+        M_list = []
+        for l_idx, load in enumerate(pos):
+            t_avg = Statistics.mean(load)
+            a = PhysicsCalculator.acceleration(t_avg, data.height)
+            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
+            m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
+            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
+            eps_list.append(eps)
+            M_list.append(M)
+        if len(eps_list) >= 2:
+            I, M_tr, sigma_I, sigma_Mtr = Regression.linear(eps_list, M_list)
+            mnk_results.append((p_idx+1, I, M_tr, sigma_I, sigma_Mtr))
+        else:
+            print(f"Позиция {p_idx+1}: недостаточно точек для регрессии")
+    if mnk_results:
+        print("Позиция  I (кг·м²)     Mтр (Н·м)    σ_I        σ_Mtr")
+        for r in mnk_results:
+            print(f"{r[0]:7d}  {r[1]:10.6f}  {r[2]:10.6f}  {r[3]:8.6f}  {r[4]:8.6f}")
+
+    # МНК для теоремы Штейнера
+    print("\nМНК для I = I0 + 4·m_гр·R² (теорема Штейнера):")
+    I_vals = []
+    R2_vals = []
+    for p_idx, pos in enumerate(data.times):
+        eps_list = []
+        M_list = []
+        for l_idx, load in enumerate(pos):
+            t_avg = Statistics.mean(load)
+            a = PhysicsCalculator.acceleration(t_avg, data.height)
+            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
+            m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
+            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
+            eps_list.append(eps)
+            M_list.append(M)
+        if len(eps_list) >= 2:
+            I, _, _, _ = Regression.linear(eps_list, M_list)
+        else:
+            I = 0.0
+        I_vals.append(I)
+
+        n = p_idx + 1
+        R = data.l1 + (n - 1) * data.l0 + data.b / 2
+        R2_vals.append(R ** 2)
+
+    if len(I_vals) >= 2:
+        m_gr4, I0, sigma_m4, sigma_I0 = Regression.linear(R2_vals, I_vals)
+        m_gr = m_gr4 / 4
+        sigma_m_gr = sigma_m4 / 4
+        print(f"  I0 = {I0:.6f} ± {sigma_I0:.6f} кг·м²")
+        print(f"  m_гр = {m_gr:.6f} ± {sigma_m_gr:.6f} кг")
+        print("  (ожидаемая масса одного груза на крестовине около 0.2-0.3 кг)")
+    else:
+        print("Недостаточно данных для регрессии.")
+
+    print("=" * 70)
+
 # ------------------------------------------------------------
 # Основная программа
 # ------------------------------------------------------------
@@ -385,6 +548,8 @@ def main():
                 print("Инструментальные измерения:")
                 for i, (val, err) in enumerate(instr_meas):
                     print(f"  {i+1}: {val} ± {err}")
+            # Предложим настроить коэффициент Стьюдента
+            set_student_coef_interactively(data)
         else:
             print(f"Не удалось загрузить данные из {default_file}")
     else:
@@ -408,19 +573,14 @@ def main():
                         print(f"  {i+1}: {val} ± {err}")
                 else:
                     print("Инструментальные измерения отсутствуют.")
+                # Предложим настроить коэффициент Стьюдента
+                set_student_coef_interactively(data)
             else:
                 print("Не удалось загрузить данные.")
             input("Нажмите Enter для продолжения...")
 
         elif choice == '2':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                print("\nИсходные данные (время в секундах):")
-                for p_idx, pos in enumerate(data.times):
-                    print(f"\nПозиция {p_idx+1}:")
-                    for l_idx, load in enumerate(pos):
-                        print(f"  Нагрузка {l_idx+1}: {load}")
+            print_full_report(data)
             input("Нажмите Enter для продолжения...")
 
         elif choice == '3':
@@ -512,7 +672,9 @@ def main():
                         t_avg = Statistics.mean(load)
                         a = PhysicsCalculator.acceleration(t_avg, data.height)
                         eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                        M = PhysicsCalculator.moment(t_avg, data.masses[l_idx], data.diameter, data.g, data.height)
+                        # Если массы не заданы, используем заглушку
+                        m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
+                        M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
                         eps_list.append(eps)
                         M_list.append(M)
                     if len(eps_list) >= 2:
@@ -579,32 +741,12 @@ def main():
             input("Нажмите Enter для продолжения...")
 
         elif choice == '10':
-            print("Текущий коэффициент Стьюдента: {:.3f}".format(data.student_coef))
-            if SCIPY_AVAILABLE:
-                ans = input("Вычислить автоматически по вероятности и числу измерений? (y/n): ").strip().lower()
-                if ans in ('y', 'yes', 'д', 'да'):
-                    prob = input_float("Доверительная вероятность (например, 0.95): ", 0.95)
-                    n = input_int("Число измерений (n): ", 3)
-                    df = n - 1
-                    t_val = stats.t.ppf((1 + prob) / 2, df)
-                    data.student_coef = t_val
-                    print(f"Коэффициент Стьюдента установлен: {t_val:.6f}")
-                else:
-                    new_t = input_float("Введите новый коэффициент Стьюдента: ", data.student_coef)
-                    data.student_coef = new_t
-            else:
-                print("SciPy не установлен. Введите коэффициент вручную.")
-                new_t = input_float("Введите новый коэффициент Стьюдента: ", data.student_coef)
-                data.student_coef = new_t
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '11':
             print("Текущая приборная погрешность времени: {:.4f} с".format(data.instr_error_time))
             new_err = input_float("Введите новую приборную погрешность (с): ", data.instr_error_time)
             data.instr_error_time = new_err
             input("Нажмите Enter для продолжения...")
 
-        elif choice == '12':
+        elif choice == '11':
             print("Ручной ввод параметров установки:")
             data.height = input_float("Высота h (м): ", data.height)
             data.diameter = input_float("Диаметр ступицы d (м): ", data.diameter)
@@ -631,6 +773,7 @@ def main():
         else:
             print("Неверный пункт меню.")
             input("Нажмите Enter для продолжения...")
+
 
 if __name__ == "__main__":
     main()
