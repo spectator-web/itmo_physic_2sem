@@ -283,38 +283,57 @@ class Regression:
 # ------------------------------------------------------------
 # Класс ExperimentData: хранение всех данных и параметров
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Класс ExperimentData: хранение всех данных и параметров
+# ------------------------------------------------------------
 class ExperimentData:
     def __init__(self):
         self.times = []          # list[position][load][measurement]
         self.instr_meas = []     # list of (value, error)
         self.student_coef = 4.3  # по умолчанию для трёх измерений и α=0.95
         self.instr_error_time = 0.25  # приборная погрешность секундомера (с)
-        self.height = 0.7       # м (по умолчанию)
-        self.diameter = 0.046     # м (по умолчанию 4.6 см)
-        self.masses = []          # кг, для каждой нагрузки
-        self.g = 9.81             # м/с²
-        # Параметры для расчёта R
-        self.l1 = 0.057           # м
-        self.l0 = 0.025           # м
-        self.b = 0.04             # м
-        self.delta_h = 0.0005      # м
-        self.delta_d = 0.0005      # м
-        self.delta_m = 0.0005      # кг
-        self.delta_g = 0.01        # м/с²
-        # Дополнительно: номера рисок (позиций)
-        self.positions = []       # список номеров рисок (например, 1..n)
+        self.height = 0.700      # м (высота падения обычно фиксирована 700 мм)
+        self.diameter = 0.046    # м 
+        self.masses = []         # кг, для каждой нагрузки
+        self.g = 9.81            # м/с²
+        self.l1 = 0.057          # м
+        self.l0 = 0.025          # м
+        self.b = 0.040           # м
+        self.delta_h = 0.0005    # м
+        self.delta_d = 0.0005    # м
+        self.delta_m = 0.0005    # кг
+        self.delta_g = 0.01      # м/с²
+        self.positions = []      
+        self.m_cross_load = 0.0  # Масса груза крестовины
 
     def load_from_parser(self, times, instr_meas):
         self.times = times
         self.instr_meas = instr_meas
-        # Попытаемся автоматически установить массы, если есть подходящие значения
-        # Например, предположим, что в instr_meas есть масса одной шайбы и масса каретки
-        # Но мы не знаем порядок. Пользователь может ввести вручную.
-        # Пока оставим пустым.
-        self.masses = []
-        # Также можно попытаться определить количество нагрузок
+        
         if times:
             self.positions = list(range(1, len(times) + 1))
+            
+        # Автоматический парсинг инструментальных измерений из файла
+        if instr_meas and len(instr_meas) >= 7:
+            # Значения делим на 1000 для перевода г -> кг и мм -> м
+            m_empty = instr_meas[0][0] / 1000.0       # 0.047 кг
+            m_washer = instr_meas[1][0] / 1000.0      # 0.220 кг
+            self.m_cross_load = instr_meas[2][0] / 1000.0 # 0.408 кг
+            
+            self.l1 = instr_meas[3][0] / 1000.0       # 0.057 м
+            self.l0 = instr_meas[4][0] / 1000.0       # 0.025 м
+            self.diameter = instr_meas[5][0] / 1000.0 # 0.046 м
+            self.b = instr_meas[6][0] / 1000.0        # 0.040 м
+            
+            # Парсинг абсолютных погрешностей из файла
+            self.delta_m = instr_meas[1][1] / 1000.0  
+            self.delta_d = instr_meas[5][1] / 1000.0  
+            self.delta_l0 = instr_meas[4][1] / 1000.0 
+
+            # Формируем массы нагрузок (m_washer * i)
+            # Это сгенерирует массив: [0.220, 0.440, 0.660, 0.880] кг
+            num_loads = self.get_num_loads()
+            self.masses = [m_washer * (i + 1) for i in range(num_loads)]
 
     def get_num_positions(self):
         return len(self.times)
@@ -328,8 +347,6 @@ class ExperimentData:
         if self.times and self.times[0]:
             return len(self.times[0][0])
         return 0
-
-
 # ------------------------------------------------------------
 # Вспомогательные функции для меню
 # ------------------------------------------------------------
