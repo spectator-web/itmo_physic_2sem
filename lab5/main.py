@@ -1,8 +1,12 @@
+
+
 import math
 import os
 import sys
 from typing import List, Tuple, Optional
-
+G_CONST = 9.81
+N_OSCILLATIONS = 10
+I_0_HUB = 8e-3
 # Попытка импорта scipy для расчёта коэффициента Стьюдента
 try:
     from scipy import stats
@@ -15,13 +19,6 @@ except ImportError:
 # Класс DataParser: разбор файла с данными
 # ------------------------------------------------------------
 class DataParser:
-    """
-    Читает файл, содержащий:
-    - команду --table[positions, loads, measurements] и блоки данных,
-    - строки с instrument_measurements (после последнего '---').
-    Поддерживает разделители: пробел, табуляция, ';'.
-    """
-
     @staticmethod
     def parse_number(s: str) -> Optional[float]:
         """Преобразует строку в число, заменяя запятую на точку."""
@@ -33,7 +30,7 @@ class DataParser:
 
     @staticmethod
     def parse_line(line: str) -> List[float]:
-        """Разбивает строку по разделителям и возвращает список чисел."""
+        """Разбивает строку по разделителям (табуляция, пробел, точка с запятой)."""
         parts = line.replace(';', ' ').replace('\t', ' ').split()
         nums = []
         for p in parts:
@@ -43,20 +40,17 @@ class DataParser:
         return nums
 
     @staticmethod
-    def parse_file(filename: str) -> Tuple[Optional[List[List[List[float]]]], Optional[List[Tuple[float, float]]]]:
-        """
-        Возвращает (times, instrument_measurements):
-        times: list[position][load][measurement]
-        instrument_measurements: list of (value, error)
-        """
+    def parse_file(filename: str):
+        """Парсит файл со структурой Таблицы 2, Таблицы 3 и констант."""
         if not os.path.exists(filename):
             print(f"Ошибка: файл '{filename}' не найден.")
-            return None, None
+            return None, None, None
 
         with open(filename, 'r', encoding='utf-8') as f:
             lines = [line.strip() for line in f]
 
-        times = []
+        damped_times = []
+        periods_times = []
         instr_meas = []
         i = 0
         n_lines = len(lines)
@@ -67,94 +61,55 @@ class DataParser:
                 i += 1
                 continue
 
-            # Обработка команды --table
-            if line.startswith('--table'):
-                # Извлекаем параметры в скобках
-                bracket = line.find('[')
-                if bracket != -1 and line.endswith(']'):
-                    params = line[bracket+1:-1].split(',')
-                    if len(params) == 3:
-                        try:
-                            num_positions = int(params[0])
-                            num_loads = int(params[1])
-                            num_meas = int(params[2])
-                        except ValueError:
-                            print("Ошибка в параметрах --table")
-                            return None, None
-                    else:
-                        print("Неверный формат --table")
-                        return None, None
-                else:
-                    print("Неверный формат --table")
-                    return None, None
-
+            # Обработка Таблицы 2 (Затухание)
+            if '--table[3,5]' in line:
                 i += 1
-                # Пропускаем пустые строки после команды
-                while i < n_lines and not lines[i]:
+                trials = []
+                while len(trials) < 3 and i < n_lines:
+                    if lines[i]:
+                        row_data = DataParser.parse_line(lines[i])
+                        if row_data:
+                            trials.append(row_data)
                     i += 1
+                # Транспонируем: из [попытка][амплитуда] в [амплитуда][попытка]
+                if len(trials) == 3:
+                    damped_times = [[trials[row][col] for row in range(3)] for col in range(5)]
+                continue
 
-                # Читаем данные для каждого положения
-                for pos in range(num_positions):
-                    pos_data = []
-                    # Для каждого положения должно быть num_loads строк
-                    for load_idx in range(num_loads):
-                        if i >= n_lines or not lines[i]:
-                            print(f"Недостаточно данных для позиции {pos+1}")
-                            return None, None
-                        row_nums = DataParser.parse_line(lines[i])
-                        # Ожидаем либо 4 числа (номер нагрузки + 3 времени), либо 3 числа (только времена)
-                        if len(row_nums) == 4:
-                            # Проверим, что номер нагрузки соответствует ожидаемому (1..num_loads)
-                            load_num = int(row_nums[0])
-                            if load_num != load_idx + 1:
-                                print(f"Предупреждение: ожидалась нагрузка {load_idx+1}, получена {load_num}")
-                            meas_times = row_nums[1:1+num_meas]
-                        elif len(row_nums) == 3:
-                            meas_times = row_nums[:num_meas]
-                        else:
-                            print(f"Неверное число чисел в строке: {lines[i]}")
-                            return None, None
-                        if len(meas_times) != num_meas:
-                            print(f"Ожидалось {num_meas} измерений, получено {len(meas_times)}")
-                            return None, None
-                        pos_data.append(meas_times)
-                        i += 1
-                    times.append(pos_data)
-                    # Пропускаем пустые строки между блоками
-                    while i < n_lines and not lines[i]:
-                        i += 1
-
-            # Обработка instrument_measurements (после последнего '---')
-            elif line == '---':
+            # Обработка Таблицы 3 (Периоды)
+            elif '--table[6,3]' in line:
                 i += 1
-                # Читаем все следующие строки до конца файла
+                while len(periods_times) < 6 and i < n_lines:
+                    if lines[i]:
+                        row_data = DataParser.parse_line(lines[i])
+                        if row_data:
+                            periods_times.append(row_data)
+                    i += 1
+                continue
+
+            # Обработка констант после разделителя
+            elif line.startswith('---'):
+                i += 1
                 while i < n_lines:
-                    line = lines[i]
-                    if not line:
+                    curr_line = lines[i]
+                    if not curr_line or curr_line.startswith('---'):
                         i += 1
                         continue
-                    # Формат: "значение +- погрешность"
-                    parts = line.replace('+-', '±').split('±')
+                    parts = curr_line.replace('+-', '±').split('±')
                     if len(parts) == 2:
                         val = DataParser.parse_number(parts[0])
                         err = DataParser.parse_number(parts[1])
-                        if val is not None and err is not None:
+                        if val is not None:
                             instr_meas.append((val, err))
-                        else:
-                            print(f"Не удалось распознать строку: {line}")
                     else:
-                        # Возможно просто число без погрешности
-                        num = DataParser.parse_number(line)
+                        num = DataParser.parse_number(curr_line)
                         if num is not None:
                             instr_meas.append((num, 0.0))
                     i += 1
-                break  # после instrument_measurements дальше ничего нет
+                break
+            i += 1
 
-            else:
-                # Игнорируем другие строки (например, комментарии)
-                i += 1
-
-        return times if times else None, instr_meas if instr_meas else None
+        return damped_times, periods_times, instr_meas
 
 
 # ------------------------------------------------------------
@@ -167,7 +122,6 @@ class Statistics:
 
     @staticmethod
     def std_dev(values: List[float], ddof: int = 1) -> float:
-        """Выборочное стандартное отклонение."""
         n = len(values)
         if n <= ddof:
             return 0.0
@@ -177,7 +131,6 @@ class Statistics:
 
     @staticmethod
     def sem(values: List[float]) -> float:
-        """Стандартная ошибка среднего."""
         n = len(values)
         if n < 2:
             return 0.0
@@ -185,54 +138,12 @@ class Statistics:
 
     @staticmethod
     def student_error(values: List[float], t_coef: float) -> float:
-        """Случайная погрешность = t * SEM."""
         return t_coef * Statistics.sem(values)
 
     @staticmethod
     def total_error(values: List[float], t_coef: float, instr_error: float) -> float:
-        """Полная погрешность = sqrt(случайная^2 + приборная^2)."""
         rand_err = Statistics.student_error(values, t_coef)
         return math.sqrt(rand_err ** 2 + ((2/3)*instr_error) ** 2)
-
-
-# ------------------------------------------------------------
-# Класс PhysicsCalculator: физические формулы
-# ------------------------------------------------------------
-class PhysicsCalculator:
-    @staticmethod
-    def acceleration(t: float, h: float) -> float:
-        """Ускорение груза: a = 2h / t^2"""
-        return 2 * h / (t * t)
-
-    @staticmethod
-    def angular_acceleration(a: float, d: float) -> float:
-        """Угловое ускорение: ε = 2a / d"""
-        return 2 * a / d
-
-    @staticmethod
-    def moment(t: float, m: float, d: float, g: float, h: float) -> float:
-        """Момент силы натяжения: M = (m*d/2)*(g - 2h/t^2)"""
-        a = PhysicsCalculator.acceleration(t, h)
-        return (m * d / 2) * (g - a)
-
-    @staticmethod
-    def delta_acceleration(a, t, dt, h, dh):
-        rel = math.sqrt((dh/h)**2 + (2*dt/t)**2)
-        return a * rel, rel
-
-    @staticmethod
-    def delta_angular_acceleration(eps, a, da, d, dd):
-        rel = math.sqrt((da/a)**2 + (dd/d)**2) if a != 0 else 0
-        return eps * rel, rel
-
-    @staticmethod
-    def delta_moment(M, m, dm, d, dd, g, dg, a, da):
-        denom = (g - a)
-        if denom == 0:
-            rel = float('inf')
-        else:
-            rel = math.sqrt((dm/m)**2 + (dd/d)**2 + (dg**2 + da**2)/(denom**2))
-        return M * rel, rel
 
 
 # ------------------------------------------------------------
@@ -242,555 +153,313 @@ class Regression:
     @staticmethod
     def linear(x: List[float], y: List[float]) -> Tuple[float, float, float, float]:
         """
-        Линейная регрессия y = a*x + b.
-        Возвращает (a, b, sigma_a, sigma_b) - коэффициенты и их стандартные ошибки.
+        МНК для аппроксимации прямой y = a*x + b.
+        Возвращает кортеж: (a, b, delta_a, delta_b), 
+        где a - угловой коэффициент, b - свободный член, 
+        delta_a и delta_b - их абсолютные погрешности.
         """
         n = len(x)
         if n < 2:
             return 0.0, 0.0, 0.0, 0.0
 
-        mean_x = sum(x) / n
-        mean_y = sum(y) / n
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_x2 = sum(xi**2 for xi in x)
+        sum_xy = sum(xi * yi for xi, yi in zip(x, y))
 
-        # Вычисляем числитель и знаменатель для a
-        cov_xy = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
-        var_x = sum((xi - mean_x) ** 2 for xi in x)
+        D = n * sum_x2 - sum_x**2
+        
+        # Защита от деления на ноль, если все x одинаковые
+        if D == 0:
+            return 0.0, 0.0, 0.0, 0.0
 
-        if abs(var_x) < 1e-12:
-            a = 0.0
-        else:
-            a = cov_xy / var_x
+        a = (n * sum_xy - sum_x * sum_y) / D
+        b = (sum_y * sum_x2 - sum_x * sum_xy) / D
 
-        b = mean_y - a * mean_x
-
-        # Остаточная сумма квадратов
-        resid = sum((y[i] - (a * x[i] + b)) ** 2 for i in range(n))
+        # Расчет погрешностей коэффициентов МНК
         if n > 2:
-            s2 = resid / (n - 2)  # дисперсия остатков
+            S_y2 = sum((yi - (a * xi + b))**2 for xi, yi in zip(x, y)) / (n - 2)
+            delta_a = math.sqrt(n * S_y2 / D) if D != 0 else 0.0
+            delta_b = math.sqrt(sum_x2 * S_y2 / D) if D != 0 else 0.0
         else:
-            s2 = 0.0
+            delta_a, delta_b = 0.0, 0.0
 
-        # Стандартные ошибки
-        if var_x > 0:
-            sigma_a = math.sqrt(s2 / var_x)
-        else:
-            sigma_a = 0.0
-        sigma_b = math.sqrt(s2 * (1.0 / n + mean_x ** 2 / var_x)) if var_x > 0 else 0.0
-
-        return a, b, sigma_a, sigma_b
+        return a, b, delta_a, delta_b
 
 
 # ------------------------------------------------------------
-# Класс ExperimentData: хранение всех данных и параметров
-# ------------------------------------------------------------
-# ------------------------------------------------------------
-# Класс ExperimentData: хранение всех данных и параметров
+# Класс ExperimentData: хранение параметров
 # ------------------------------------------------------------
 class ExperimentData:
     def __init__(self):
-        self.times = []          # list[position][load][measurement]
-        self.instr_meas = []     # list of (value, error)
-        self.student_coef = 4.3  # по умолчанию для трёх измерений и α=0.95
-        self.instr_error_time = 0.25  # приборная погрешность секундомера (с)
-        self.height = 0.700      # м (высота падения обычно фиксирована 700 мм)
-        self.diameter = 0.046    # м 
-        self.masses = []         # кг, для каждой нагрузки
-        self.g = 9.81            # м/с²
-        self.l1 = 0.057          # м
-        self.l0 = 0.025          # м
-        self.b = 0.040           # м
-        self.delta_h = 0.0005    # м
-        self.delta_d = 0.0005    # м
-        self.delta_m = 0.0005    # кг
-        self.delta_g = 0.01      # м/с²
-        self.positions = []      
-        self.m_cross_load = 0.0  # Масса груза крестовины
-
-    def load_from_parser(self, times, instr_meas):
-        self.times = times
-        self.instr_meas = instr_meas
+        self.damped_times = []      # [amplitude_idx][trial] -> times
+        self.periods_times = []     # [position][trial] -> times of 10 oscillations
         
-        if times:
-            self.positions = list(range(1, len(times) + 1))
+        # --- ИСХОДНЫЕ ДАННЫЕ УГЛОВ (не загружаются из файла) ---
+        self.amplitudes = [25, 20, 15, 10, 5]
+        self.A0 = 30 # Начальная амплитуда в градусах
+
+        self.student_coef = 4.3 
+        self.instr_error_time = 0.25 # Погрешность секундомера
+        
+        # Физические параметры установки (по умолчанию)
+        self.g = 9.81
+        self.m_gr = 0.220           # кг (масса одного груза)
+        self.I0 = 0.008             # кг*м^2 (момент инерции крестовины по методичке)
+        self.l1 = 0.057             # м
+        self.l0 = 0.025             # м
+        self.b = 0.040              # м
+        
+    def load_from_parser(self, damped, periods, instr_meas):
+        if damped:
+            self.damped_times = damped
+        if periods:
+            self.periods_times = periods
             
-        # Автоматический парсинг инструментальных измерений из файла
         if instr_meas and len(instr_meas) >= 7:
-            # Значения делим на 1000 для перевода г -> кг и мм -> м
-            m_empty = instr_meas[0][0] / 1000.0       # 0.047 кг
-            m_washer = instr_meas[1][0] / 1000.0      # 0.220 кг
-            self.m_cross_load = instr_meas[2][0] / 1000.0 # 0.408 кг
-            
-            self.l1 = instr_meas[3][0] / 1000.0       # 0.057 м
-            self.l0 = instr_meas[4][0] / 1000.0       # 0.025 м
-            self.diameter = instr_meas[5][0] / 1000.0 # 0.046 м
-            self.b = instr_meas[6][0] / 1000.0        # 0.040 м
-            
-            # Парсинг абсолютных погрешностей из файла
-            self.delta_m = instr_meas[1][1] / 1000.0  
-            self.delta_d = instr_meas[5][1] / 1000.0  
-            self.delta_l0 = instr_meas[4][1] / 1000.0 
+            self.m_gr = instr_meas[1][0] / 1000.0   
+            self.l1 = instr_meas[3][0] / 1000.0     
+            self.l0 = instr_meas[4][0] / 1000.0     
+            self.b = instr_meas[6][0] / 1000.0      
 
-            # Формируем массы нагрузок (m_washer * i)
-            # Это сгенерирует массив: [0.220, 0.440, 0.660, 0.880] кг
-            num_loads = self.get_num_loads()
-            self.masses = [m_washer * (i + 1) for i in range(num_loads)]
 
-    def get_num_positions(self):
-        return len(self.times)
-
-    def get_num_loads(self):
-        if self.times:
-            return len(self.times[0])
-        return 0
-
-    def get_num_measurements(self):
-        if self.times and self.times[0]:
-            return len(self.times[0][0])
-        return 0
 # ------------------------------------------------------------
-# Вспомогательные функции для меню
+# Вспомогательные функции для вычислений 1.05
+# ------------------------------------------------------------
+def calc_R(data: ExperimentData, mark: int) -> float:
+    return data.l1 + (mark - 1) * data.l0 + data.b / 2
+
+def calc_I_gr(data: ExperimentData, mark_side: int) -> float:
+    R_up = calc_R(data, 1)
+    R_down = calc_R(data, 6)
+    R_side = calc_R(data, mark_side)
+    return data.m_gr * (R_up**2 + R_down**2 + 2 * R_side**2)
+
+def calc_l_teor(data: ExperimentData) -> float:
+    R_up = calc_R(data, 1)
+    R_down = calc_R(data, 6)
+    return abs(R_down - R_up) / 4
+
+
+# ------------------------------------------------------------
+# Интерфейс
 # ------------------------------------------------------------
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
-
-def print_menu(data: ExperimentData):
-    print("\n" + "=" * 70)
-    print("   ЛАБОРАТОРНАЯ РАБОТА №1.04: МАЯТНИК ОБЕРБЕКА")
-    print("=" * 70)
-    print(f"Файл загружен: {'да' if data.times else 'нет'}")
-    if data.times:
-        print(f"  Позиций: {data.get_num_positions()}, Нагрузок: {data.get_num_loads()}, Измерений: {data.get_num_measurements()}")
-    print(f"Текущие параметры:")
-    print(f"  Коэф. Стьюдента t = {data.student_coef:.3f}")
-    print(f"  Приборная погрешность времени = {data.instr_error_time:.4f} с")
-    print(f"  Высота h = {data.height:.3f} м")
-    print(f"  Диаметр ступицы d = {data.diameter:.4f} м")
-    print(f"  g = {data.g:.2f} м/с²")
-    if data.masses:
-        print(f"  Массы нагрузок: {data.masses}")
-    print("-" * 70)
-    print("1. Загрузить данные из файла")
-    print("2. Показать полный отчёт (все данные и расчёты)")
-    print("3. Рассчитать средние времена")
-    print("4. Рассчитать статистику (СКО, погрешности)")
-    print("5. Рассчитать физические величины (a, ε, M)")
-    print("6. МНК для M(ε) (определить I и Mтр по позициям)")
-    print("7. МНК для I(R²) (проверка теоремы Штейнера)")
-    print("8. Вывести итоговую таблицу (position load t1 t2 t3 t_avg sigma dt a epsilon M)")
-    print("9. Экспорт таблицы в файл")
-    print("10. Изменить приборную погрешность времени")
-    print("11. Ручной ввод параметров установки")
+def print_menu():
+    print("\n" + "=" * 75)
+    print(" ЛАБОРАТОРНАЯ РАБОТА №1.05: КОЛЕБАНИЯ ФИЗИЧЕСКОГО МАЯТНИКА")
+    print("=" * 75)
+    print("1. Загрузить данные из файла (input.txt)")
+    print("2. Таблица 2 и анализ затухания (вязкое/сухое трение + погрешности)")
+    print("3. Таблица 3 (периоды колебаний + погрешности)")
+    print("4. Таблица 4 (моменты инерции и приведенная длина)")
+    print("5. Расчет МНК для всех данных (Затухание и T^2 от I)")
+    print("6. Вывести ВСЕ данные и расчеты (Полный отчет с МНК и погрешностями)")
     print("0. Выход")
-    print("-" * 70)
+    print("-" * 75)
+
+def analyze_damped(data: ExperimentData):
+    if not data.damped_times:
+        print("\n[!] Данные для затухания не загружены.")
+        return
+        
+    print("\n--- ТАБЛИЦА 2: Затухающие колебания ---")
+    print("Амплитуда (°)\t" + "\t".join(str(a) for a in data.amplitudes))
+    
+    for i in range(3):
+        row_str = f"t{i+1}, c \t\t" + "\t".join(f"{data.damped_times[j][i]:.2f}" for j in range(5))
+        print(row_str)
+        
+    t_avgs = [Statistics.mean(data.damped_times[j]) for j in range(5)]
+    # Расчет полной погрешности для времени
+    t_errs = [Statistics.total_error(data.damped_times[j], data.student_coef, data.instr_error_time) for j in range(5)]
+    
+    print("t_ср ± Δt, c \t" + "\t".join(f"{t:.2f}±{e:.2f}" for t, e in zip(t_avgs, t_errs)))
+    
+    # Регрессия: Вязкое трение ( ln(A/A0) = -beta * t )
+    y_viscous = [math.log(A / data.A0) for A in data.amplitudes]
+    slope_visc, intercept_visc, _, _ = Regression.linear(t_avgs, y_viscous)
+    beta = -slope_visc
+    tau = 1 / beta if beta != 0 else float('inf')
+    
+    # Регрессия: Сухое трение ( A = A0 - k*t )
+    y_dry = data.amplitudes
+    slope_dry, intercept_dry, _, _ = Regression.linear(t_avgs, y_dry)
+    
+    # Берем T из Таблицы 3 (3-я риска)
+    T_val = 1.8  # fallback
+    if len(data.periods_times) >= 3:
+        T_val = Statistics.mean(data.periods_times[2]) / 10.0
+        
+    delta_phi_z = - (slope_dry * T_val) / 4 if slope_dry < 0 else 0
+    
+    # Оценка числа периодов до остановки
+    periods_to_stop = data.A0 / (4 * delta_phi_z) if delta_phi_z > 0 else float('inf')
+
+    print("\n--- АНАЛИЗ ТИПА ТРЕНИЯ ---")
+    print(f"Период маятника в конфигурации для затухания T ≈ {T_val:.3f} с")
+    print(f"Гипотеза ВЯЗКОГО трения [ln(A/A0) = -β*t]:")
+    print(f"  Коэф. затухания β = {beta:.5f} с⁻¹")
+    print(f"  Время затухания τ = {tau:.2f} с")
+    
+    print(f"\nГипотеза СУХОГО трения [A = A0 - k*t]:")
+    print(f"  Угловой коэфф. k = {slope_dry:.4f} град/с")
+    print(f"  Зона застоя Δφ_з = {delta_phi_z:.3f}°")
+    print(f"  Оценочное число периодов до полной остановки: N ≈ {math.ceil(periods_to_stop)} колебаний")
 
 
-def input_float(prompt: str, default: Optional[float] = None) -> float:
-    while True:
-        s = input(prompt).strip()
-        if not s and default is not None:
-            return default
-        try:
-            return float(s.replace(',', '.'))
-        except ValueError:
-            print("Ошибка: введите число.")
+def analyze_periods(data: ExperimentData):
+    if not data.periods_times:
+        print("\n[!] Данные для периодов не загружены.")
+        return
+        
+    print("\n--- ТАБЛИЦА 3: Периоды колебаний (N=10) ---")
+    print("Положение\tt1\tt2\tt3\tt_ср ± Δt (с)\tT ± ΔT (с)")
+    
+    for i, trials in enumerate(data.periods_times):
+        t_avg = Statistics.mean(trials)
+        t_err = Statistics.total_error(trials, data.student_coef, data.instr_error_time)
+        T = t_avg / 10.0
+        T_err = t_err / 10.0 # Погрешность периода в 10 раз меньше погрешности 10 колебаний
+        trials_str = "\t".join(f"{t:.2f}" for t in trials)
+        print(f"{i+1} риска\t\t{trials_str}\t{t_avg:.2f} ± {t_err:.2f}\t{T:.4f} ± {T_err:.4f}")
 
 
-def input_int(prompt: str, default: Optional[int] = None) -> int:
-    while True:
-        s = input(prompt).strip()
-        if not s and default is not None:
-            return default
-        try:
-            return int(s)
-        except ValueError:
-            print("Ошибка: введите целое число.")
+def analyze_inertia(data: ExperimentData):
+    if not data.periods_times:
+        print("\n[!] Данные для расчетов не загружены.")
+        return
+        
+    print("\n--- ТАБЛИЦА 4: Моменты инерции и Приведенная длина ---")
+    
+    R_up = calc_R(data, 1)
+    R_down = calc_R(data, 6)
+    l_teor = calc_l_teor(data)
+    m_total_gr = 4 * data.m_gr
+    
+    print(f"Константы: R_верх = {R_up:.4f} м, R_ниж = {R_down:.4f} м")
+    print(f"l_теор (от грузов) = {l_teor:.4f} м")
+    
+    print("\nРиски\t\t1\t\t2\t\t3\t\t4\t\t5\t\t6")
+    
+    R_sides = [calc_R(data, i) for i in range(1, 7)]
+    print("R_бок, м\t" + "\t".join(f"{r:.4f}" for r in R_sides))
+    
+    I_grs = [calc_I_gr(data, i) for i in range(1, 7)]
+    print("I_гр, кг·м²\t" + "\t".join(f"{i:.5f}" for i in I_grs))
+    
+    Is = [igr + data.I0 for igr in I_grs]
+    print("I, кг·м²\t" + "\t".join(f"{i:.5f}" for i in Is))
+    
+    T_vals = [Statistics.mean(row) / 10.0 for row in data.periods_times]
+    T2_vals = [T**2 for T in T_vals]
+    
+    l_pr_exps = [(data.g * T2) / (4 * math.pi**2) for T2 in T2_vals]
+    print("l_пр_эксп, м\t" + "\t".join(f"{l:.4f}" for l in l_pr_exps))
+    
+    l_pr_teors = [I / (m_total_gr * l_teor) for I in Is]
+    print("l_пр_теор, м\t" + "\t".join(f"{l:.4f}" for l in l_pr_teors))
+    
+    print("\n--- ПРОВЕРКА T²(I) И РАСЧЕТ ml ---")
+    slope_I, intercept_I, _, _ = Regression.linear(Is, T2_vals)
+    
+    ml_exp = (4 * math.pi**2) / (data.g * slope_I) if slope_I > 0 else 0
+    ml_teor = m_total_gr * l_teor
+    
+    print(f"Наклон T²(I) k = {slope_I:.4f} с²/кг·м²")
+    print(f"Экспериментальное (ml)_эксп = {ml_exp:.5f} кг·м")
+    print(f"Теоретическое (ml)_теор = {ml_teor:.5f} кг·м")
 
-
-def set_student_coef_interactively(data: ExperimentData):
-    """Предлагает пользователю изменить коэффициент Стьюдента."""
-    print(f"\nТекущий коэффициент Стьюдента: {data.student_coef:.3f}")
-    if SCIPY_AVAILABLE:
-        ans = input("Вычислить автоматически по вероятности и числу измерений? (y/n): ").strip().lower()
-        if ans in ('y', 'yes', 'д', 'да'):
-            prob = input_float("Доверительная вероятность (например, 0.95): ", 0.95)
-            n = input_int("Число измерений (n): ", data.get_num_measurements() or 3)
-            df = n - 1
-            t_val = stats.t.ppf((1 + prob) / 2, df)
-            data.student_coef = t_val
-            print(f"Коэффициент Стьюдента установлен: {t_val:.6f}")
-            return
-    # Если scipy недоступен или пользователь отказался, предложим ввести вручную
-    new_t = input_float("Введите коэффициент Стьюдента вручную (Enter для сохранения текущего): ", data.student_coef)
-    data.student_coef = new_t
-
-
-def print_full_report(data: ExperimentData):
-    """Выводит полный отчёт: параметры, исходные данные, статистику, расчёты, МНК."""
-    if not data.times:
-        print("Данные не загружены.")
+# ------------------------------------------------------------
+# Новые функции для пунктов 5 и 6
+# ------------------------------------------------------------
+def analyze_mnk(data: ExperimentData):
+    """
+    Пункт 5: Вычисление МНК для вязкого трения и моментов инерции.
+    Сюда необходимо передать подготовленные массивы X и Y из ваших данных.
+    """
+    print("\n" + "-" * 50)
+    print(" РАСЧЕТ МНК ДЛЯ ВСЕХ ДАННЫХ ")
+    print("-" * 50)
+    
+    if not data.damped_times and not data.periods_times:
+        print("[!] Нет загруженных данных для расчёта МНК.")
         return
 
-    # Параметры установки
-    print("\n" + "=" * 70)
-    print("ПОЛНЫЙ ОТЧЁТ")
-    print("=" * 70)
-    print("Параметры установки:")
-    print(f"  Высота падения h = {data.height:.3f} м")
-    print(f"  Диаметр ступицы d = {data.diameter:.4f} м")
-    print(f"  g = {data.g:.2f} м/с²")
-    print(f"  l1 = {data.l1:.3f} м, l0 = {data.l0:.3f} м, b = {data.b:.3f} м")
-    print(f"  Приборная погрешность времени = {data.instr_error_time:.4f} с")
-    print(f"  Коэффициент Стьюдента = {data.student_coef:.3f}")
-    print(f"  Погрешности измерений: dh = {data.delta_h:.4f} м, dd = {data.delta_d:.4f} м, dm = {data.delta_m:.4f} кг, dg = {data.delta_g:.4f} м/с²")
-    if data.masses:
-        print(f"  Массы нагрузок: {data.masses} кг")
-    else:
-        print("  Массы нагрузок не заданы (будут использованы значения по умолчанию).")
+    # Пример структуры расчета (замените x_data и y_data на реальные массивы из объекта data)
+    print("1. МНК для графика затухания (вязкое трение: ln(A) от t):")
+    # x_data_damped = [...] # время t
+    # y_data_damped = [...] # ln(A0/A)
+    # a_damp, b_damp, da_damp, db_damp = Regression.linear(x_data_damped, y_data_damped)
+    print("   Коэффициент затухания (beta) = ... +/- ...")
+    
+    print("\n2. МНК для периодов (T^2 от I):")
+    # x_data_inertia = [...] # Моменты инерции I
+    # y_data_periods = [...] # T^2
+    # a_per, b_per, da_per, db_per = Regression.linear(x_data_inertia, y_data_periods)
+    print("   Угловой коэффициент (a) = ... +/- ...")
+    print("   (Используется для нахождения произведения m*l)")
+    print("-" * 50)
 
-    # Исходные данные (времена)
-    print("\nИсходные данные (время в секундах):")
-    for p_idx, pos in enumerate(data.times):
-        print(f"Позиция {p_idx+1}:")
-        for l_idx, load in enumerate(pos):
-            print(f"  Нагрузка {l_idx+1}: {load}")
+def print_full_report(data: ExperimentData):
+    """
+    Пункт 6: Вывод всех таблиц и расчетов разом.
+    """
+    print("\n" + "=" * 75)
+    print(" ПОЛНЫЙ ОТЧЕТ (ВСЕ ДАННЫЕ И РАСЧЕТЫ) ")
+    print("=" * 75)
+    
+    analyze_damped(data)
+    analyze_periods(data)
+    analyze_inertia(data)
+    analyze_mnk(data)
+    
+    print("=" * 75)
 
-    # Статистика времени
-    print("\nСтатистика времени:")
-    print("Pos Load  t_avg     sigma     dt_rand   dt_total  rel%")
-    for p_idx, pos in enumerate(data.times):
-        for l_idx, load in enumerate(pos):
-            avg = Statistics.mean(load)
-            sigma = Statistics.std_dev(load)
-            rand_err = Statistics.student_error(load, data.student_coef)
-            total_err = Statistics.total_error(load, data.student_coef, data.instr_error_time)
-            rel = (total_err / avg * 100) if avg != 0 else 0
-            print(f"{p_idx+1:3d} {l_idx+1:4d}  {avg:8.6f}  {sigma:8.6f}  {rand_err:8.6f}  {total_err:8.6f}  {rel:6.2f}%")
-
-    # Физические величины с погрешностями
-    print("\nФизические величины (по среднему времени):")
-    print("Pos Load   t_avg      a (м/с²)   da        ε (рад/с²) deps      M (Н·м)    dM")
-    for p_idx, pos in enumerate(data.times):
-        for l_idx, load in enumerate(pos):
-            t_avg = Statistics.mean(load)
-            dt = Statistics.total_error(load, data.student_coef, data.instr_error_time)
-            a = PhysicsCalculator.acceleration(t_avg, data.height)
-            da, _ = PhysicsCalculator.delta_acceleration(a, t_avg, dt, data.height, data.delta_h)
-            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-            deps, _ = PhysicsCalculator.delta_angular_acceleration(eps, a, da, data.diameter, data.delta_d)
-            # Определяем массу нагрузки (если не задана, используем заглушку)
-            if l_idx < len(data.masses):
-                m_load = data.masses[l_idx]
-            else:
-                m_load = 0.22 * (l_idx + 1)
-            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
-            dM, _ = PhysicsCalculator.delta_moment(M, m_load, data.delta_m, data.diameter, data.delta_d, data.g, data.delta_g, a, da)
-            print(f"{p_idx+1:3d} {l_idx+1:4d}  {t_avg:8.6f}  {a:10.6f}  {da:8.6f}  {eps:10.6f}  {deps:8.6f}  {M:10.6f}  {dM:8.6f}")
-
-    # МНК для M(ε) по каждой позиции
-    print("\nМНК для зависимости M = I·ε + Mтр по каждой позиции:")
-    mnk_results = []
-    for p_idx, pos in enumerate(data.times):
-        eps_list = []
-        M_list = []
-        for l_idx, load in enumerate(pos):
-            t_avg = Statistics.mean(load)
-            a = PhysicsCalculator.acceleration(t_avg, data.height)
-            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-            m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
-            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
-            eps_list.append(eps)
-            M_list.append(M)
-        if len(eps_list) >= 2:
-            I, M_tr, sigma_I, sigma_Mtr = Regression.linear(eps_list, M_list)
-            mnk_results.append((p_idx+1, I, M_tr, sigma_I, sigma_Mtr))
-        else:
-            print(f"Позиция {p_idx+1}: недостаточно точек для регрессии")
-    if mnk_results:
-        print("Позиция  I (кг·м²)     Mтр (Н·м)    σ_I        σ_Mtr")
-        for r in mnk_results:
-            print(f"{r[0]:7d}  {r[1]:10.6f}  {r[2]:10.6f}  {r[3]:8.6f}  {r[4]:8.6f}")
-
-    # МНК для теоремы Штейнера
-    print("\nМНК для I = I0 + 4·m_гр·R² (теорема Штейнера):")
-    I_vals = []
-    R2_vals = []
-    for p_idx, pos in enumerate(data.times):
-        eps_list = []
-        M_list = []
-        for l_idx, load in enumerate(pos):
-            t_avg = Statistics.mean(load)
-            a = PhysicsCalculator.acceleration(t_avg, data.height)
-            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-            m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
-            M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
-            eps_list.append(eps)
-            M_list.append(M)
-        if len(eps_list) >= 2:
-            I, _, _, _ = Regression.linear(eps_list, M_list)
-        else:
-            I = 0.0
-        I_vals.append(I)
-
-        n = p_idx + 1
-        R = data.l1 + (n - 1) * data.l0 + data.b / 2
-        R2_vals.append(R ** 2)
-
-    if len(I_vals) >= 2:
-        m_gr4, I0, sigma_m4, sigma_I0 = Regression.linear(R2_vals, I_vals)
-        m_gr = m_gr4 / 4
-        sigma_m_gr = sigma_m4 / 4
-        print(f"  I0 = {I0:.6f} ± {sigma_I0:.6f} кг·м²")
-        print(f"  m_гр = {m_gr:.6f} ± {sigma_m_gr:.6f} кг")
-        print("  (ожидаемая масса одного груза на крестовине около 0.2-0.3 кг)")
-    else:
-        print("Недостаточно данных для регрессии.")
-
-    print("=" * 70)
-
-# ------------------------------------------------------------
-# Основная программа
-# ------------------------------------------------------------
 def main():
     data = ExperimentData()
+    filename = "lab5/input.txt"
     
-    # Автоматическая загрузка данных при старте
-    default_file = "lab2/input.txt"
-    if os.path.exists(default_file):
-        times, instr_meas = DataParser.parse_file(default_file)
-        if times is not None:
-            data.load_from_parser(times, instr_meas)
-            print(f"Данные автоматически загружены из {default_file}")
-            if instr_meas:
-                print("Инструментальные измерения:")
-                for i, (val, err) in enumerate(instr_meas):
-                    print(f"  {i+1}: {val} ± {err}")
-            # Предложим настроить коэффициент Стьюдента
-            set_student_coef_interactively(data)
-        else:
-            print(f"Не удалось загрузить данные из {default_file}")
-    else:
-        print(f"Файл {default_file} не найден. Загрузите данные вручную (пункт 1).")
-    
+    if os.path.exists(filename):
+        damped, periods, instr_meas = DataParser.parse_file(filename)
+        data.load_from_parser(damped, periods, instr_meas)
+        print(f"Данные автоматически загружены из '{filename}'")
+
     while True:
-        clear_screen()
-        print_menu(data)
+        print_menu()
         choice = input("Выберите действие: ").strip()
 
         if choice == '1':
-            # Загрузка из фиксированного файла
-            filename = "lab2/input.txt"
-            times, instr_meas = DataParser.parse_file(filename)
-            if times is not None:
-                data.load_from_parser(times, instr_meas)
-                print("Данные успешно загружены.")
-                if instr_meas:
-                    print("Инструментальные измерения:")
-                    for i, (val, err) in enumerate(instr_meas):
-                        print(f"  {i+1}: {val} ± {err}")
-                else:
-                    print("Инструментальные измерения отсутствуют.")
-                # Предложим настроить коэффициент Стьюдента
-                set_student_coef_interactively(data)
-            else:
-                print("Не удалось загрузить данные.")
+            damped, periods, instr_meas = DataParser.parse_file(filename)
+            data.load_from_parser(damped, periods, instr_meas)
+            print("Данные успешно загружены.")
             input("Нажмите Enter для продолжения...")
-
+            
         elif choice == '2':
-            print_full_report(data)
-            input("Нажмите Enter для продолжения...")
-
+            analyze_damped(data)
+            input("\nНажмите Enter для продолжения...")
+            
         elif choice == '3':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                print("\nСредние времена:")
-                for p_idx, pos in enumerate(data.times):
-                    print(f"Позиция {p_idx+1}:")
-                    for l_idx, load in enumerate(pos):
-                        avg = Statistics.mean(load)
-                        print(f"  Нагрузка {l_idx+1}: {avg:.6f} с")
-            input("Нажмите Enter для продолжения...")
-
+            analyze_periods(data)
+            input("\nНажмите Enter для продолжения...")
+            
         elif choice == '4':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                print("\nСтатистика по каждому набору измерений:")
-                print("Pos Load  t_avg     sigma     dt_rand   dt_total  rel%")
-                for p_idx, pos in enumerate(data.times):
-                    for l_idx, load in enumerate(pos):
-                        avg = Statistics.mean(load)
-                        sigma = Statistics.std_dev(load)
-                        rand_err = Statistics.student_error(load, data.student_coef)
-                        total_err = Statistics.total_error(load, data.student_coef, data.instr_error_time)
-                        rel = (total_err / avg * 100) if avg != 0 else 0
-                        print(f"{p_idx+1:3d} {l_idx+1:4d}  {avg:8.6f}  {sigma:8.6f}  {rand_err:8.6f}  {total_err:8.6f}  {rel:6.2f}%")
-            input("Нажмите Enter для продолжения...")
-
+            analyze_inertia(data)
+            input("\nНажмите Enter для продолжения...")
         elif choice == '5':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                if not data.masses:
-                    print("Внимание: не заданы массы нагрузок. Используем массы по умолчанию: 0.22, 0.44, ...")
-                    num_loads = data.get_num_loads()
-                    data.masses = [0.22 * (i+1) for i in range(num_loads)]
-                print("\nФизические величины (по среднему времени):")
-                print("Pos Load   t_avg      a (м/с²)   ε (рад/с²)  M (Н·м)")
-                for p_idx, pos in enumerate(data.times):
-                    for l_idx, load in enumerate(pos):
-                        t_avg = Statistics.mean(load)
-                        a = PhysicsCalculator.acceleration(t_avg, data.height)
-                        eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                        M = PhysicsCalculator.moment(t_avg, data.masses[l_idx], data.diameter, data.g, data.height)
-                        print(f"{p_idx+1:3d} {l_idx+1:4d}  {t_avg:8.6f}  {a:10.6f}  {eps:10.6f}  {M:10.6f}")
-            input("Нажмите Enter для продолжения...")
-
+            analyze_mnk(data)
+            input("\nНажмите Enter для продолжения...")
+                
         elif choice == '6':
-            if not data.times or not data.masses:
-                print("Необходимо загрузить данные и задать массы нагрузок.")
-            else:
-                print("\nМНК для зависимости M = I·ε + Mтр по каждой позиции:")
-                results = []
-                for p_idx, pos in enumerate(data.times):
-                    eps_list = []
-                    M_list = []
-                    for l_idx, load in enumerate(pos):
-                        t_avg = Statistics.mean(load)
-                        a = PhysicsCalculator.acceleration(t_avg, data.height)
-                        eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                        M = PhysicsCalculator.moment(t_avg, data.masses[l_idx], data.diameter, data.g, data.height)
-                        eps_list.append(eps)
-                        M_list.append(M)
-                    if len(eps_list) >= 2:
-                        I, M_tr, sigma_I, sigma_Mtr = Regression.linear(eps_list, M_list)
-                        results.append((p_idx+1, I, M_tr, sigma_I, sigma_Mtr))
-                    else:
-                        print(f"Позиция {p_idx+1}: недостаточно точек для регрессии")
-
-                print("\nРезультаты МНК:")
-                print("Позиция  I (кг·м²)     Mтр (Н·м)    σ_I        σ_Mtr")
-                for r in results:
-                    print(f"{r[0]:7d}  {r[1]:10.6f}  {r[2]:10.6f}  {r[3]:8.6f}  {r[4]:8.6f}")
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '7':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                print("\nМНК для I = I0 + 4·m_гр·R² (теорема Штейнера)")
-                I_vals = []
-                R2_vals = []
-                for p_idx, pos in enumerate(data.times):
-                    eps_list = []
-                    M_list = []
-                    for l_idx, load in enumerate(pos):
-                        t_avg = Statistics.mean(load)
-                        a = PhysicsCalculator.acceleration(t_avg, data.height)
-                        eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                        # Если массы не заданы, используем заглушку
-                        m_load = data.masses[l_idx] if l_idx < len(data.masses) else 0.22 * (l_idx+1)
-                        M = PhysicsCalculator.moment(t_avg, m_load, data.diameter, data.g, data.height)
-                        eps_list.append(eps)
-                        M_list.append(M)
-                    if len(eps_list) >= 2:
-                        I, _, _, _ = Regression.linear(eps_list, M_list)
-                    else:
-                        I = 0.0
-                    I_vals.append(I)
-
-                    n = p_idx + 1
-                    R = data.l1 + (n - 1) * data.l0 + data.b / 2
-                    R2_vals.append(R ** 2)
-
-                if len(I_vals) >= 2:
-                    I0, m_gr4, sigma_I0, sigma_m4 = Regression.linear(R2_vals, I_vals)
-                    m_gr = m_gr4 / 4
-                    sigma_m_gr = sigma_m4 / 4
-                    print(f"\nРезультаты:")
-                    print(f"  I0 = {I0:.6f} ± {sigma_I0:.6f} кг·м²")
-                    print(f"  m_гр = {m_gr:.6f} ± {sigma_m_gr:.6f} кг")
-                    print("Проверка: ожидаемая масса одного груза на крестовине около 0.2-0.3 кг.")
-                else:
-                    print("Недостаточно данных для регрессии.")
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '8':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                if not data.masses:
-                    num_loads = data.get_num_loads()
-                    data.masses = [0.22 * (i+1) for i in range(num_loads)]
-                print("\nИТОГОВАЯ ТАБЛИЦА")
-                print("Pos\tLoad\tt1\tt2\tt3\tt_avg\tsigma\tdt\ta\tepsilon\tM")
-                for p_idx, pos in enumerate(data.times):
-                    for l_idx, load in enumerate(pos):
-                        t1, t2, t3 = load[0], load[1], load[2] if len(load) > 2 else 0.0
-                        t_avg = Statistics.mean(load)
-                        sigma = Statistics.std_dev(load)
-                        dt = Statistics.total_error(load, data.student_coef, data.instr_error_time)
-                        a = PhysicsCalculator.acceleration(t_avg, data.height)
-                        eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                        M = PhysicsCalculator.moment(t_avg, data.masses[l_idx], data.diameter, data.g, data.height)
-                        print(f"{p_idx+1}\t{l_idx+1}\t{t1:.3f}\t{t2:.3f}\t{t3:.3f}\t{t_avg:.6f}\t{sigma:.6f}\t{dt:.6f}\t{a:.6f}\t{eps:.6f}\t{M:.6f}")
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '9':
-            if not data.times:
-                print("Данные не загружены.")
-            else:
-                fname = "results.txt"  # фиксированное имя файла для экспорта
-                with open(fname, 'w', encoding='utf-8') as f:
-                    f.write("Pos\tLoad\tt1\tt2\tt3\tt_avg\tsigma\tdt\ta\tepsilon\tM\n")
-                    for p_idx, pos in enumerate(data.times):
-                        for l_idx, load in enumerate(pos):
-                            t1, t2, t3 = load[0], load[1], load[2] if len(load) > 2 else 0.0
-                            t_avg = Statistics.mean(load)
-                            sigma = Statistics.std_dev(load)
-                            dt = Statistics.total_error(load, data.student_coef, data.instr_error_time)
-                            a = PhysicsCalculator.acceleration(t_avg, data.height)
-                            eps = PhysicsCalculator.angular_acceleration(a, data.diameter)
-                            M = PhysicsCalculator.moment(t_avg, data.masses[l_idx], data.diameter, data.g, data.height)
-                            f.write(f"{p_idx+1}\t{l_idx+1}\t{t1:.3f}\t{t2:.3f}\t{t3:.3f}\t{t_avg:.6f}\t{sigma:.6f}\t{dt:.6f}\t{a:.6f}\t{eps:.6f}\t{M:.6f}\n")
-                print(f"Таблица сохранена в {fname}")
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '10':
-            print("Текущая приборная погрешность времени: {:.4f} с".format(data.instr_error_time))
-            new_err = input_float("Введите новую приборную погрешность (с): ", data.instr_error_time)
-            data.instr_error_time = new_err
-            input("Нажмите Enter для продолжения...")
-
-        elif choice == '11':
-            print("Ручной ввод параметров установки:")
-            data.height = input_float("Высота h (м): ", data.height)
-            data.diameter = input_float("Диаметр ступицы d (м): ", data.diameter)
-            data.g = input_float("Ускорение g (м/с²): ", data.g)
-            if data.times:
-                num_loads = data.get_num_loads()
-                print(f"Введите массы для {num_loads} нагрузок (кг):")
-                masses = []
-                for i in range(num_loads):
-                    m = input_float(f"  Нагрузка {i+1}: ", 0.22*(i+1))
-                    masses.append(m)
-                data.masses = masses
-            else:
-                print("Сначала загрузите данные, чтобы определить количество нагрузок.")
-            data.l1 = input_float("Расстояние до первой риски l1 (м): ", data.l1)
-            data.l0 = input_float("Шаг рисок l0 (м): ", data.l0)
-            data.b = input_float("Размер груза b (м): ", data.b)
-            input("Нажмите Enter для продолжения...")
-
+            clear_screen()
+            print("==== ПОЛНЫЙ ОТЧЕТ ЛАБ 1.05 ====")
+            print_full_report(data)
+            input("\nНажмите Enter для продолжения...")
+            
         elif choice == '0':
-            print("Выход из программы.")
             break
-
-        else:
-            print("Неверный пункт меню.")
-            input("Нажмите Enter для продолжения...")
-
 
 if __name__ == "__main__":
     main()
